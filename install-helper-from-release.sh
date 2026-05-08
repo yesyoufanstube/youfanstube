@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# OpenTube Helper Peer 一键安装（从 GitHub Release）
+# YouFansTube Helper Peer 一键安装（从 GitHub Release）
 #
 # ┌──────────────────────────────────────────────────────────────────┐
 # │ 模式 A：Foundation 流程（admin 通过 console wizard 触发）         │
@@ -23,7 +23,7 @@
 #   2. 下 helper-bundle-linux-<arch>.tar.gz + .sig.json from GitHub Release
 #   3. 验 sha256（防传输损坏）
 #   4. 验 ed25519 签名（防部署链投毒；trusted Foundation pubkey hardcoded 下方）
-#   5. 解到 /opt/opentube-helper（备份现有 libp2p-key.bin）
+#   5. 解到 /opt/youfanstube-helper（备份现有 libp2p-key.bin）
 #   6. 写 systemd unit + start
 #
 # Volunteer 额外步骤：
@@ -35,7 +35,7 @@ set -euo pipefail
 # ─── 受信 Foundation 公钥（同 client app trustedSigners） ───
 # PeerID 1AhjvaqGKX1ws3neeR8CazJeUfApUxKXCNnfNUQieiCfnx
 # Algo:  ed25519
-# 派生于 ~/.opentube-foundation/keys/foundation-bootstrap.seed (2026-05-06)
+# 派生于 ~/.youfanstube-foundation/keys/foundation-bootstrap.seed (2026-05-06)
 FOUNDATION_TRUSTED_PEERIDS=("1AhjvaqGKX1ws3neeR8CazJeUfApUxKXCNnfNUQieiCfnx")
 FOUNDATION_PEM='-----BEGIN PUBLIC KEY-----
 MCowBQYDK2VwAyEAqUcIj0RRs60cWYJFx0rLRPS3cSkNtGN4QFn999gls+k=
@@ -68,11 +68,11 @@ fi
 : "${PEER_IPV4:?PEER_IPV4 required (this VPS public ipv4)}"
 RELEASE_TAG=${RELEASE_TAG:-v0.1.0-helper}
 RELEASE_REPO=${RELEASE_REPO:-yesyoufanstube/youfanstube}
-SERVICE_NAME=${SERVICE_NAME:-opentube-helper}
+SERVICE_NAME=${SERVICE_NAME:-youfanstube-helper}
 P2P_TCP_PORT=${P2P_TCP_PORT:-14001}
 P2P_WS_PORT=${P2P_WS_PORT:-14002}
-INSTALL_DIR=${INSTALL_DIR:-/opt/opentube-helper}
-DATA_DIR=${DATA_DIR:-/var/lib/opentube-helper}
+INSTALL_DIR=${INSTALL_DIR:-/opt/youfanstube-helper}
+DATA_DIR=${DATA_DIR:-/var/lib/youfanstube-helper}
 PRESERVE_PEERID=${PRESERVE_PEERID:-1}
 
 if [ "$(id -u)" -ne 0 ]; then
@@ -152,7 +152,7 @@ SHA256=$(jq -r .sha256 "$TMPDIR/$SIG_NAME")
 SIZE=$(jq -r .size "$TMPDIR/$SIG_NAME")
 BUILT_AT=$(jq -r .builtAt "$TMPDIR/$SIG_NAME")
 {
-  printf 'opentube-helper-bundle-v1\n'
+  printf 'youfanstube-helper-bundle-v1\n'
   printf 'name=%s\n' "$NAME"
   printf 'version=%s\n' "$VERSION"
   printf 'platform=%s\n' "$SIG_PLATFORM"
@@ -244,7 +244,7 @@ ${PEER_HOSTNAME}:8443 {
     }
     handle {
         header Content-Type text/html
-        respond "<!DOCTYPE html><html><body>OpenTube Volunteer Helper — see github.com/${RELEASE_REPO}</body></html>" 200
+        respond "<!DOCTYPE html><html><body>YouFansTube Volunteer Helper — see github.com/${RELEASE_REPO}</body></html>" 200
     }
 }
 CADDY
@@ -265,7 +265,7 @@ fi
 # ─── 9. 写 systemd unit + start ─────────────────────────
 cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<UNIT
 [Unit]
-Description=OpenTube Helper Peer (release: ${RELEASE_TAG} ${PLATFORM})
+Description=YouFansTube Helper Peer (release: ${RELEASE_TAG} ${PLATFORM})
 After=network-online.target
 Wants=network-online.target
 
@@ -327,7 +327,7 @@ if systemctl is-active --quiet "${SERVICE_NAME}.service"; then
 下一步（30 秒内 Caddy 会拿到 sslip.io cert）：
   1. 等 ~30s，验证 cert：
        curl -sI https://${PEER_HOSTNAME}:8443/ | head
-  2. 你的 helper 会自动发 GossipSub 'opentube/exit-node-advertise/v1' 公告
+  2. 你的 helper 会自动发 GossipSub 'youfanstube/exit-node-advertise/v1' 公告
      —— 客户端连上 Foundation peer 后会通过 mesh 学到你
   3. （可选）把 multiaddr 分享给朋友 / 加进他们的客户端 settings：
        Settings → Bootstrap → "添加自定义 multiaddr"
