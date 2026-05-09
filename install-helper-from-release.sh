@@ -2,17 +2,19 @@
 # YouFansTube Helper Peer 一键安装（从 GitHub Release）
 #
 # ┌──────────────────────────────────────────────────────────────────┐
-# │ 模式 A：Foundation 流程（admin 通过 console wizard 触发）         │
-# │   sudo PEER_HOSTNAME=peer3.youfanstube.com PEER_IPV4=1.2.3.4 bash  │
+# │ 模式 A：Foundation 流程（admin 通过 console UI 触发）             │
+# │   sudo PEER_HOSTNAME=peer3.youfanstube.com PEER_IPV4=1.2.3.4 \    │
+# │        PEER_ID=3 PEER_TOKEN=<64hex> CONSOLE_URL=https://… bash    │
 # │   - 域名由 Foundation 持有 + CF DNS                                │
-# │   - 不在脚本里装 Caddy，Foundation peer VPS 已经装过                 │
+# │   - 默认装 helper + Caddy + agent（一行命令搞定）                    │
+# │   - Caddy lib 兼容 peer1 / peer2 已有手配的 Caddyfile（marker-based） │
 # │   - 装完 admin 把 PeerID 进 console，Foundation 签 SignedPeerList   │
 # │                                                                    │
 # │ 模式 B：Volunteer 流程（任何人，零域名零 console 权限）              │
 # │   sudo VOLUNTEER_MODE=1 bash                                       │
 # │   - 自动拿公网 IP → <ip-with-dashes>.sslip.io 当 hostname            │
-# │   - 顺便装 Caddy + 自动 ACME（sslip.io 是真实 DNS，能颁 cert）        │
-# │   - bind libp2p WS 到 localhost:14002，Caddy 反代 :8443 → :14002    │
+# │   - 装 helper + Caddy + 自动 ACME（sslip.io 是真实 DNS，能颁 cert）   │
+# │   - 不装 agent（无 console 权限，无 token 可用）                     │
 # │   - 不进 SignedPeerList — 通过 GossipSub exitNodeAdvertise 自播     │
 # │   - 客户端先连 Foundation peers（Bootstrap），通过 mesh 学到你         │
 # │   - reputation 累积良好 → Foundation 可能 promote 进 SignedPeerList │
@@ -25,10 +27,11 @@
 #   4. 验 ed25519 签名（防部署链投毒；trusted Foundation pubkey hardcoded 下方）
 #   5. 解到 /opt/youfanstube-helper（备份现有 libp2p-key.bin）
 #   6. 写 systemd unit + start
-#
-# Volunteer 额外步骤：
-#   7. apt install caddy + 写 Caddyfile + ufw allow 8443/14001/80
-#   8. 输出 multiaddr / 让 volunteer 分享给朋友 / 加进个人 settings
+#   7. INSTALL_CADDY=1（默认）→ 调 lib/setup-helper-caddy.sh：apt install caddy
+#      + 写 Caddyfile (marker-based，老 peer 已有手配 block 时保留) + ufw 80/8443
+#   8. 若 PEER_TOKEN+PEER_ID+CONSOLE_URL 全设 → 顺便装 helper-agent（Foundation
+#      场景一行命令 helper+caddy+agent 全装齐；volunteer 没 token 跳过）
+#   9. 输出 multiaddr
 
 set -euo pipefail
 
@@ -43,6 +46,11 @@ MCowBQYDK2VwAyEAqUcIj0RRs60cWYJFx0rLRPS3cSkNtGN4QFn999gls+k=
 
 # ─── 配置（env 可覆写） ──────────────────────────────────
 VOLUNTEER_MODE=${VOLUNTEER_MODE:-0}
+INSTALL_CADDY=${INSTALL_CADDY:-1}    # 默认装 Caddy（Foundation + Volunteer 都装；
+                                     # setup-helper-caddy.sh 自带"已有 hostname 块就跳过"
+                                     # marker-based 兼容老 peer 已手配的 Caddyfile）
+INSTALL_AGENT=${INSTALL_AGENT:-auto} # auto = 检测 PEER_TOKEN+PEER_ID+CONSOLE_URL 全
+                                     # 设时装；显式 0 / 1 强制控制
 
 # Volunteer 模式：自动拿公网 IP → sslip.io hostname；其它字段后面再 default
 if [ "$VOLUNTEER_MODE" = "1" ]; then
@@ -184,27 +192,45 @@ echo "✓ ed25519 ok（signer ${SIGNER_PEERID:0:12}…）"
 # 落实 [M7-CHANNEL-MODE.md §1.3](../../docs/specs/playbooks/M7-CHANNEL-MODE.md)
 # 与客户端 [`migrateUserData.ts`](../../app/src/main/services/migrateUserData.ts) 服务端对应。
 #
-# 已迁移过（sentinel 存在）→ 跳过。
+# 已迁移过（sentinel 存在）→ 仍 sweep 残留 .timer 防遗漏（早期版本只停 .service
+# 漏了 .timer，导致 opentube-helper-agent.timer 一直在跑触发 oneshot service →
+# console UI 报红假警报）。
 # 老 helper 部署存在 → 停 / disable 旧 unit + 复制数据 + 写 sentinel。
-# 老不存在 → 跳过（全新部署）。
+# 老不存在 + 无 sentinel → 跳过（全新部署）。
 OLD_INSTALL_DIR=/opt/opentube-helper
 OLD_DATA_DIR=/var/lib/opentube-helper
-OLD_SERVICE_NAMES=(opentube-helper opentube-helper-agent)
+# 含 service + timer 双形态的老 unit（agent / watchdog 都是 timer-triggered oneshot）
+OLD_UNITS=(opentube-helper opentube-helper-agent opentube-watchdog)
 MIGRATION_SENTINEL="$DATA_DIR/.migrated-from-opentube"
 
+# 共享 sweep 函数：停 + disable 任何残留的 opentube-* .service / .timer
+# sentinel 存在场景也跑（修旧版迁移漏停 .timer 的 bug）
+sweep_legacy_units() {
+  local found=0
+  for unit in "${OLD_UNITS[@]}"; do
+    for ext in service timer; do
+      if systemctl list-unit-files 2>/dev/null | grep -q "^${unit}\.${ext}"; then
+        if systemctl is-active --quiet "${unit}.${ext}" 2>/dev/null \
+           || systemctl is-enabled --quiet "${unit}.${ext}" 2>/dev/null; then
+          systemctl stop "${unit}.${ext}" 2>/dev/null || true
+          systemctl disable "${unit}.${ext}" 2>/dev/null || true
+          echo "  ✓ stopped + disabled ${unit}.${ext}"
+          found=1
+        fi
+      fi
+    done
+  done
+  [ "$found" = "1" ] && systemctl daemon-reload 2>/dev/null || true
+}
+
 if [ -f "$MIGRATION_SENTINEL" ]; then
-  echo "ⓘ migration already done (sentinel: $MIGRATION_SENTINEL)"
+  echo "ⓘ migration already done (sentinel: $MIGRATION_SENTINEL) — sweep 残留 .timer 防遗漏"
+  sweep_legacy_units
 elif [ -d "$OLD_INSTALL_DIR" ] || [ -d "$OLD_DATA_DIR" ]; then
   echo "▶ M7 一次性迁移：opentube-helper → youfanstube-helper"
 
-  # 停 / disable 旧 unit（多个候选名兼容历史部署）
-  for unit in "${OLD_SERVICE_NAMES[@]}"; do
-    if systemctl list-unit-files 2>/dev/null | grep -q "^${unit}.service"; then
-      systemctl stop "${unit}.service" 2>/dev/null || true
-      systemctl disable "${unit}.service" 2>/dev/null || true
-      echo "  ✓ stopped + disabled ${unit}.service"
-    fi
-  done
+  # 停 / disable 旧 unit（含 .service + .timer）
+  sweep_legacy_units
 
   # 复制（不是 mv）数据目录到新路径——保 PeerID / libp2p-key / cache。
   # 旧目录保留作 fallback，操作员确认后手动清理。
@@ -266,59 +292,33 @@ if [ -n "$KEY_BACKUP" ]; then
   rm "$KEY_BACKUP"
 fi
 
-# ─── 8.5. Volunteer 模式：装 Caddy + Caddyfile + ufw ────
-if [ "$VOLUNTEER_MODE" = "1" ]; then
-  echo "▶ Volunteer 模式：装 Caddy + 配 sslip.io ACME"
-
-  if ! command -v caddy >/dev/null; then
-    echo "  ⌥ apt install caddy（用 Cloudsmith 官方源）"
-    apt-get install -qq -y debian-keyring debian-archive-keyring apt-transport-https gpg 2>&1 | tail -3
-    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
-    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | tee /etc/apt/sources.list.d/caddy-stable.list >/dev/null
-    apt-get update -qq 2>&1 | tail -3
-    DEBIAN_FRONTEND=noninteractive apt-get install -qq -y caddy 2>&1 | tail -3
-  fi
-
-  # 写最小 Caddyfile —— 单 host: <ip>.sslip.io:8443 反代 WS → :14002，
-  # 同时做静态根目录给 /speedtest 之类 health probe 用
-  CADDY_EMAIL=${CADDY_EMAIL:-volunteer-${PEER_IPV4//./-}@noreply.sslip.io}
-  cat > /etc/caddy/Caddyfile <<CADDY
-{
-    email ${CADDY_EMAIL}
-    https_port 8443
-    http_port 80
-}
-
-${PEER_HOSTNAME}:8443 {
-    @websockets {
-        header_regexp Connection (?i)upgrade
-        header_regexp Upgrade (?i)websocket
-    }
-    handle @websockets {
-        reverse_proxy 127.0.0.1:${P2P_WS_PORT} {
-            flush_interval -1
-            transport http {
-                versions 1.1
-            }
-        }
-    }
-    handle {
-        header Content-Type text/html
-        respond "<!DOCTYPE html><html><body>YouFansTube Volunteer Helper — see github.com/${RELEASE_REPO}</body></html>" 200
-    }
-}
-CADDY
-  systemctl enable --now caddy 2>&1 | tail -3 || systemctl restart caddy
-  echo "  ✓ Caddy 配好（ACME 会在后台拿 cert，~30s 内完成）"
-
-  # ufw 开端口：8443 (Caddy WSS)、14001 (libp2p TCP)、80 (ACME http-01 challenge)
-  if command -v ufw >/dev/null; then
-    for port in 80 8443 14001; do
-      ufw allow ${port}/tcp >/dev/null 2>&1 || true
-    done
-    echo "  ✓ ufw allow 80/8443/14001"
+# ─── 8.5. 装 Caddy（共享 lib，Foundation + Volunteer 都跑）───
+# Caddy 安装本身共享 lib/setup-helper-caddy.sh — deploy-helper-peer.sh dev CLI
+# 路径也调同一份 lib，避免两边漂移。
+# 本脚本是 curl|bash 流程，VPS 上没有本仓库；从 raw.githubusercontent 拉 lib
+# （信任根与本脚本一致 — 都来自 ${RELEASE_REPO}/main）。
+#
+# lib 是 marker-based + idempotent：peer1 / peer2 已有手配的 Caddyfile（无 marker）
+# 时，lib 检测到 hostname 已配 → 不动现有配置仅 reload。新 peer 走 fresh 写入或
+# marker 替换路径。
+if [ "$INSTALL_CADDY" = "1" ]; then
+  if [ "$VOLUNTEER_MODE" = "1" ]; then
+    echo "▶ Volunteer 模式：装 Caddy + 配 ACME（sslip.io）"
+    CADDY_LANDING_HTML="<!DOCTYPE html><html><body>YouFansTube Volunteer Helper — see github.com/${RELEASE_REPO}</body></html>"
   else
-    echo "  ⚠ 没 ufw — 自己确保 80/8443/14001 出入站放行"
+    echo "▶ Foundation 模式：装 Caddy + 配 ACME（${PEER_HOSTNAME}）"
+    CADDY_LANDING_HTML="<!DOCTYPE html><html><body>YouFansTube Foundation Helper Peer ${PEER_HOSTNAME}</body></html>"
+  fi
+  LIB_REF=${LIB_REF:-main}
+  LIB_URL=${LIB_URL:-https://raw.githubusercontent.com/${RELEASE_REPO}/${LIB_REF}/scripts/foundation/lib/setup-helper-caddy.sh}
+  CADDY_LANDING_HTML="$CADDY_LANDING_HTML" \
+    PEER_HOSTNAME="$PEER_HOSTNAME" PEER_IPV4="$PEER_IPV4" P2P_WS_PORT="$P2P_WS_PORT" \
+    bash <(curl -fsSL "$LIB_URL")
+
+  # 14001（libp2p TCP）不属于 caddy lib 的范围；这里统一放行
+  if command -v ufw >/dev/null; then
+    ufw allow 14001/tcp >/dev/null 2>&1 || true
+    echo "  ✓ ufw allow 14001 (libp2p TCP)"
   fi
 fi
 
@@ -398,8 +398,46 @@ if systemctl is-active --quiet "${SERVICE_NAME}.service"; then
 谢谢贡献！🙏  问题/反馈：github.com/${RELEASE_REPO}/issues
 EOL
   else
+    # Foundation 模式 next-steps
     cat <<EOL
 Next: 把 PeerID + IPv4 + hostname 录入 console (/peers/new)
+EOL
+  fi
+
+  # ─── 10. 装 helper-agent（Foundation 一体化路径） ───────
+  # 仅当 PEER_TOKEN + PEER_ID + CONSOLE_URL 三个 env 全设时装；缺任意 → 跳过
+  # （volunteer 没 token；console 没传齐时 operator 后续手动装也行）
+  SHOULD_INSTALL_AGENT=0
+  if [ "$INSTALL_AGENT" = "auto" ]; then
+    if [ -n "${PEER_ID:-}" ] && [ -n "${PEER_TOKEN:-}" ] && [ -n "${CONSOLE_URL:-}" ]; then
+      SHOULD_INSTALL_AGENT=1
+    fi
+  elif [ "$INSTALL_AGENT" = "1" ]; then
+    SHOULD_INSTALL_AGENT=1
+  fi
+
+  if [ "$SHOULD_INSTALL_AGENT" = "1" ]; then
+    if [ -z "${PEER_ID:-}" ] || [ -z "${PEER_TOKEN:-}" ] || [ -z "${CONSOLE_URL:-}" ]; then
+      echo "▶ INSTALL_AGENT=1 但缺 env: 需 PEER_ID + PEER_TOKEN + CONSOLE_URL — 跳过 agent 安装"
+    else
+      echo ""
+      echo "▶ 装 helper-agent（PEER_ID=$PEER_ID, CONSOLE_URL=$CONSOLE_URL）"
+      AGENT_INSTALLER_URL="https://raw.githubusercontent.com/${RELEASE_REPO}/${LIB_REF:-main}/scripts/foundation/install-helper-agent.sh"
+      # 强制 install-helper-agent.sh 内部 REPO_RAW 也用 RELEASE_REPO 对齐——
+      # 不传时它默认 zbspace01/youfanstube 这个 legacy mirror，可能拉不到 helper-agent.sh
+      AGENT_REPO_RAW="https://github.com/${RELEASE_REPO}/raw/${LIB_REF:-main}"
+      PEER_ID="$PEER_ID" PEER_HOSTNAME="$PEER_HOSTNAME" \
+        PEER_TOKEN="$PEER_TOKEN" CONSOLE_URL="$CONSOLE_URL" \
+        YOUFANSTUBE_REPO_RAW="$AGENT_REPO_RAW" \
+        bash <(curl -fsSL "$AGENT_INSTALLER_URL")
+      echo ""
+      echo "✓ helper-agent 装齐 — console 60s 内会出现 metrics push"
+    fi
+  elif [ "$VOLUNTEER_MODE" != "1" ]; then
+    cat <<EOL
+
+ⓘ 没装 agent —— Foundation peer 推荐装上让 console 看到健康指标。
+  在 console 该 peer 详情页 rotate token，复制一体化命令重跑此脚本即可。
 EOL
   fi
 else
