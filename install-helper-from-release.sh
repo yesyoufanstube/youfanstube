@@ -180,6 +180,66 @@ if ! openssl pkeyutl -verify -pubin -inkey "$TMPDIR/trusted.pem" -rawin -in "$TM
 fi
 echo "✓ ed25519 ok（signer ${SIGNER_PEERID:0:12}…）"
 
+# ─── 5.5. M7 一次性迁移：opentube-helper → youfanstube-helper ──
+# 落实 [M7-CHANNEL-MODE.md §1.3](../../docs/specs/playbooks/M7-CHANNEL-MODE.md)
+# 与客户端 [`migrateUserData.ts`](../../app/src/main/services/migrateUserData.ts) 服务端对应。
+#
+# 已迁移过（sentinel 存在）→ 跳过。
+# 老 helper 部署存在 → 停 / disable 旧 unit + 复制数据 + 写 sentinel。
+# 老不存在 → 跳过（全新部署）。
+OLD_INSTALL_DIR=/opt/opentube-helper
+OLD_DATA_DIR=/var/lib/opentube-helper
+OLD_SERVICE_NAMES=(opentube-helper opentube-helper-agent)
+MIGRATION_SENTINEL="$DATA_DIR/.migrated-from-opentube"
+
+if [ -f "$MIGRATION_SENTINEL" ]; then
+  echo "ⓘ migration already done (sentinel: $MIGRATION_SENTINEL)"
+elif [ -d "$OLD_INSTALL_DIR" ] || [ -d "$OLD_DATA_DIR" ]; then
+  echo "▶ M7 一次性迁移：opentube-helper → youfanstube-helper"
+
+  # 停 / disable 旧 unit（多个候选名兼容历史部署）
+  for unit in "${OLD_SERVICE_NAMES[@]}"; do
+    if systemctl list-unit-files 2>/dev/null | grep -q "^${unit}.service"; then
+      systemctl stop "${unit}.service" 2>/dev/null || true
+      systemctl disable "${unit}.service" 2>/dev/null || true
+      echo "  ✓ stopped + disabled ${unit}.service"
+    fi
+  done
+
+  # 复制（不是 mv）数据目录到新路径——保 PeerID / libp2p-key / cache。
+  # 旧目录保留作 fallback，操作员确认后手动清理。
+  if [ -d "$OLD_DATA_DIR" ] && [ ! -d "$DATA_DIR" ]; then
+    mkdir -p "$DATA_DIR"
+    chmod 700 "$DATA_DIR"
+    cp -a "$OLD_DATA_DIR/." "$DATA_DIR/"
+    echo "  ✓ copied $OLD_DATA_DIR/ → $DATA_DIR/"
+  elif [ -d "$DATA_DIR" ]; then
+    echo "  ⓘ $DATA_DIR 已存在，跳过数据复制（避免覆盖）"
+  fi
+
+  # Foundation 密钥目录（仅 Foundation 操作员机器有 / 普通 helper 不动）
+  if [ -d "$HOME/.opentube-foundation" ] && [ ! -d "$HOME/.youfanstube-foundation" ]; then
+    cp -a "$HOME/.opentube-foundation" "$HOME/.youfanstube-foundation"
+    echo "  ✓ copied ~/.opentube-foundation/ → ~/.youfanstube-foundation/"
+  fi
+
+  # 写 sentinel（避免重复迁移）
+  mkdir -p "$DATA_DIR"
+  cat > "$MIGRATION_SENTINEL" <<EOF_SENTINEL
+{
+  "fromName": "opentube-helper",
+  "toName": "youfanstube-helper",
+  "migratedAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "oldInstallDir": "$OLD_INSTALL_DIR",
+  "oldDataDir": "$OLD_DATA_DIR",
+  "oldServiceNames": ["${OLD_SERVICE_NAMES[0]}", "${OLD_SERVICE_NAMES[1]}"]
+}
+EOF_SENTINEL
+  echo "  ✓ sentinel: $MIGRATION_SENTINEL"
+  echo "  ⓘ 旧目录保留作 fallback。确认 youfanstube-helper.service 稳定运行后手动清理："
+  echo "      sudo rm -rf $OLD_INSTALL_DIR $OLD_DATA_DIR"
+fi
+
 # ─── 6. 备份 libp2p-key（保 PeerID） ─────────────────────
 KEY_BACKUP=""
 if [ "$PRESERVE_PEERID" = "1" ] && [ -f "$DATA_DIR/libp2p-key.bin" ]; then
