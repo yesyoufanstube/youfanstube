@@ -51,6 +51,12 @@ INSTALL_CADDY=${INSTALL_CADDY:-1}    # 默认装 Caddy（Foundation + Volunteer 
                                      # marker-based 兼容老 peer 已手配的 Caddyfile）
 INSTALL_AGENT=${INSTALL_AGENT:-auto} # auto = 检测 PEER_TOKEN+PEER_ID+CONSOLE_URL 全
                                      # 设时装；显式 0 / 1 强制控制
+INSTALL_MIHOMO=${INSTALL_MIHOMO:-1}   # 默认装 mihomo binary 备用（不启 service / 不配订阅）
+                                     # 让 helper 默认就具备 proxy 能力,运营者后续跑
+                                     # install-helper-proxy.sh 推订阅 + 启动才真正生效。
+                                     # 装好后:/opt/yfs-helper-proxy/mihomo + systemd unit (disabled)
+                                     # 设 INSTALL_MIHOMO=0 跳过(节省 ~30 MB 二进制 + 1 个 systemd unit)
+MIHOMO_VERSION=${MIHOMO_VERSION:-v1.18.10}
 
 # Volunteer 模式：自动拿公网 IP → sslip.io hostname；其它字段后面再 default
 if [ "$VOLUNTEER_MODE" = "1" ]; then
@@ -322,6 +328,68 @@ if [ "$INSTALL_CADDY" = "1" ]; then
   fi
 fi
 
+# ─── 8.6. 装 mihomo binary 备用（不启 service / 不配订阅）─────────
+# 让新 helper 上线默认就具备 proxy 能力。运营者后续按需:
+#   1. 本机建 ~/.youfanstube-foundation/proxy/<peer>.env 填订阅 URL
+#   2. 跑 scripts/foundation/install-helper-proxy.sh <peer> --apply-drop-in
+# install-helper-proxy.sh 会 scp config.yaml + enable+start mihomo + 切节点 + healthcheck
+# 配套 toggle-helper-tier.sh 切 helper EXIT_UPSTREAM_PROXY drop-in
+#
+# 这里只做 idempotent 装 binary + 写 systemd unit (disabled):
+# - 已有 mihomo binary 时跳过下载(允许 install-helper-proxy 强制 --reinstall 覆盖)
+# - systemd unit 写好但不 enable 不 start,等运营者真要用时再 enable
+# - /opt/yfs-helper-proxy/config.yaml 不写(空目录,等 install-helper-proxy 推订阅)
+if [ "$INSTALL_MIHOMO" = "1" ]; then
+  echo "▶ 装 mihomo binary 备用 (${MIHOMO_VERSION},不启 service)"
+  MIHOMO_DIR=/opt/yfs-helper-proxy
+  mkdir -p "$MIHOMO_DIR"
+  case "$ARCH" in
+    x64)   MIHOMO_M=amd64 ;;
+    arm64) MIHOMO_M=arm64 ;;
+    *) echo "  ! mihomo: unsupported arch=$ARCH,跳过"; MIHOMO_M="" ;;
+  esac
+  if [ -n "$MIHOMO_M" ]; then
+    if [ ! -x "$MIHOMO_DIR/mihomo" ]; then
+      MIHOMO_URL="https://github.com/MetaCubeX/mihomo/releases/download/${MIHOMO_VERSION}/mihomo-linux-${MIHOMO_M}-${MIHOMO_VERSION}.gz"
+      if curl -sL "$MIHOMO_URL" -o "$MIHOMO_DIR/mihomo.gz"; then
+        gunzip -f "$MIHOMO_DIR/mihomo.gz"
+        chmod +x "$MIHOMO_DIR/mihomo"
+        echo "  ✓ /opt/yfs-helper-proxy/mihomo 装好"
+      else
+        echo "  ! mihomo binary 下载失败 (不致命,helper 主流程继续) — 重试: INSTALL_MIHOMO=1 重跑本脚本"
+        rm -f "$MIHOMO_DIR/mihomo.gz"
+      fi
+    else
+      echo "  ✓ /opt/yfs-helper-proxy/mihomo 已存在,跳过"
+    fi
+
+    # systemd unit (disabled by default,等 install-helper-proxy 时 enable+start)
+    # 防止误启时缺 config.yaml 报错,加 ConditionPathExists 守卫
+    cat > /etc/systemd/system/yfs-helper-proxy.service <<UNIT
+[Unit]
+Description=mihomo SOCKS5 upstream for yfs-helper (managed by install-helper-proxy.sh)
+After=network-online.target
+Wants=network-online.target
+# 没 config.yaml 时启动会 fail,加 Condition 让 systemctl start 直接 skip
+ConditionPathExists=${MIHOMO_DIR}/config.yaml
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=${MIHOMO_DIR}
+ExecStart=${MIHOMO_DIR}/mihomo -d ${MIHOMO_DIR}
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    systemctl daemon-reload
+    echo "  ✓ /etc/systemd/system/yfs-helper-proxy.service 写好 (disabled,等 install-helper-proxy 推 config.yaml 后 enable+start)"
+    echo "  下一步: 运营者本机跑 scripts/foundation/install-helper-proxy.sh <peer-name> [--apply-drop-in]"
+  fi
+fi
+
 # ─── 9. 写 systemd unit + start ─────────────────────────
 cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<UNIT
 [Unit]
@@ -340,7 +408,9 @@ Environment=OT_P2P_LISTEN_WS=${P2P_WS_PORT}
 Environment=OT_P2P_PUBLIC_IP=${PEER_IPV4}
 Environment=OT_P2P_WS_LOCALHOST_ONLY=1
 Environment=OT_HELPER_EXIT_ENABLED=1
-Environment=OT_HELPER_MAX_STREAMS=32
+# 128 并发流(2026-05-12 上调,原 32)。理由见 scripts/foundation/deploy-helper-peer.sh
+# 同段注释:单 SABR client 多 itag prefetch 在 32 下密集撞 STATUS_OVER_CAPACITY。
+Environment=OT_HELPER_MAX_STREAMS=128
 Environment=OT_HELPER_BYTES_PER_SEC=52428800
 ExecStart=${INSTALL_DIR}/node ${INSTALL_DIR}/helper.mjs
 Restart=on-failure
